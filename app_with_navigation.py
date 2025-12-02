@@ -16,6 +16,22 @@ import warnings
 # Suppress MongoDB schema migration warnings
 warnings.filterwarnings('ignore', message='ensure_column skipped for MongoDB')
 
+def _wants_json_response():
+    """Detect if the caller expects a JSON response.
+    Returns True for XHR, JSON requests, or when Accept includes application/json.
+    """
+    try:
+        if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+            return True
+        if request.is_json:
+            return True
+        accept = request.headers.get('Accept', '') or ''
+        if 'application/json' in accept.lower():
+            return True
+    except Exception:
+        pass
+    return False
+
 def time_to_minutes(time_str):
     """Convert time string (HH:MM) to minutes since midnight"""
     h, m = map(int, time_str.split(':'))
@@ -363,7 +379,7 @@ def login_required(f):
     def decorated_function(*args, **kwargs):
         if 'user_id' not in session:
             # If the caller expects JSON (XHR), return JSON error instead of redirect
-            if request.headers.get('X-Requested-With') == 'XMLHttpRequest' or request.is_json:
+            if _wants_json_response():
                 return jsonify({'success': False, 'error': 'Authentication required'}), 401
             return redirect(url_for('login'))
         return f(*args, **kwargs)
@@ -374,13 +390,13 @@ def admin_required(f):
     def decorated_function(*args, **kwargs):
         if 'user_id' not in session:
             # If the caller expects JSON (XHR), return JSON error instead of redirect
-            if request.headers.get('X-Requested-With') == 'XMLHttpRequest' or request.is_json:
+            if _wants_json_response():
                 return jsonify({'success': False, 'error': 'Authentication required'}), 401
             return redirect(url_for('login'))
         user = User.query.get(session['user_id'])
         if not user or user.role != 'admin':
             # For XHR/JSON callers return JSON error; otherwise flash and redirect.
-            if request.headers.get('X-Requested-With') == 'XMLHttpRequest' or request.is_json:
+            if _wants_json_response():
                 return jsonify({'success': False, 'error': 'Access denied. Admin privileges required.'}), 403
             flash('Access denied. Admin privileges required.', 'danger')
             return redirect(url_for('index'))
@@ -440,6 +456,37 @@ def logout():
     session.clear()
     flash('You have been logged out', 'info')
     return redirect(url_for('login'))
+
+# Error handlers that respect JSON callers
+@app.errorhandler(401)
+def handle_401(e):
+    if _wants_json_response():
+        return jsonify({'success': False, 'error': 'Authentication required'}), 401
+    return e
+
+@app.errorhandler(403)
+def handle_403(e):
+    if _wants_json_response():
+        return jsonify({'success': False, 'error': 'Access denied'}), 403
+    return e
+
+@app.errorhandler(404)
+def handle_404(e):
+    if _wants_json_response():
+        return jsonify({'success': False, 'error': 'Not found'}), 404
+    return e
+
+@app.errorhandler(405)
+def handle_405(e):
+    if _wants_json_response():
+        return jsonify({'success': False, 'error': 'Method not allowed'}), 405
+    return e
+
+@app.errorhandler(500)
+def handle_500(e):
+    if _wants_json_response():
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+    return e
 
 
 @app.route('/download-template/<entity>')
