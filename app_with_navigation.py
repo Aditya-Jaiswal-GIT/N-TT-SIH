@@ -12,6 +12,7 @@ import math
 import pandas as pd
 from pymongo.errors import DuplicateKeyError as IntegrityError
 import warnings
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # Suppress MongoDB schema migration warnings
 warnings.filterwarnings('ignore', message='ensure_column skipped for MongoDB')
@@ -21,12 +22,17 @@ def _wants_json_response():
     Returns True for XHR, JSON requests, or when Accept includes application/json.
     """
     try:
-        if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+        hdrs = request.headers
+        if hdrs.get('X-Requested-With') == 'XMLHttpRequest':
             return True
         if request.is_json:
             return True
-        accept = request.headers.get('Accept', '') or ''
+        accept = hdrs.get('Accept', '') or ''
         if 'application/json' in accept.lower():
+            return True
+        # Many fetch() calls omit Accept but include CORS-related headers
+        # Treat CORS requests as API calls expecting JSON by default
+        if hdrs.get('Origin') or hdrs.get('Sec-Fetch-Mode'):
             return True
     except Exception:
         pass
@@ -282,6 +288,13 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['MONGO_URI'] = 'mongodb+srv://Aditya:Aditya%40212005@cluster0.sndj6yw.mongodb.net/timetable?appName=Cluster0'
 app.config['MONGO_DBNAME'] = 'timetable'
 app.config['SECRET_KEY'] = 'your-secret-key-change-this-in-production'
+# Trust proxy headers so Flask detects HTTPS and correct host/port behind proxies
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
+# Secure cookie settings for cross-site usage (adjust if same-site only)
+app.config.update(
+    SESSION_COOKIE_SAMESITE='None',
+    SESSION_COOKIE_SECURE=True,
+)
 # Initialize our MongoDB-backed db compatibility layer
 db.init_app(app)
 
@@ -312,6 +325,11 @@ def inject_next_page():
             return {'next_page': None}
 
     return {'next_page': None}
+
+# Simple health check for load balancers
+@app.route('/health')
+def health():
+    return jsonify({'status': 'ok'}), 200
 
 # Initialize database
 with app.app_context():
