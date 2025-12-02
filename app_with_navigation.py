@@ -12,31 +12,9 @@ import math
 import pandas as pd
 from pymongo.errors import DuplicateKeyError as IntegrityError
 import warnings
-from werkzeug.middleware.proxy_fix import ProxyFix
 
 # Suppress MongoDB schema migration warnings
 warnings.filterwarnings('ignore', message='ensure_column skipped for MongoDB')
-
-def _wants_json_response():
-    """Detect if the caller expects a JSON response.
-    Returns True for XHR, JSON requests, or when Accept includes application/json.
-    """
-    try:
-        hdrs = request.headers
-        if hdrs.get('X-Requested-With') == 'XMLHttpRequest':
-            return True
-        if request.is_json:
-            return True
-        accept = hdrs.get('Accept', '') or ''
-        if 'application/json' in accept.lower():
-            return True
-        # Many fetch() calls omit Accept but include CORS-related headers
-        # Treat CORS requests as API calls expecting JSON by default
-        if hdrs.get('Origin') or hdrs.get('Sec-Fetch-Mode'):
-            return True
-    except Exception:
-        pass
-    return False
 
 def time_to_minutes(time_str):
     """Convert time string (HH:MM) to minutes since midnight"""
@@ -285,16 +263,9 @@ def generate_time_slots():
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///timetable.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['MONGO_URI'] = 'mongodb+srv://Aditya:Aditya%40212005@cluster0.sndj6yw.mongodb.net/timetable?appName=Cluster0'
+app.config['MONGO_URI'] = 'mongodb://localhost:27017'
 app.config['MONGO_DBNAME'] = 'timetable'
 app.config['SECRET_KEY'] = 'your-secret-key-change-this-in-production'
-# Trust proxy headers so Flask detects HTTPS and correct host/port behind proxies
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
-# Secure cookie settings for cross-site usage (adjust if same-site only)
-app.config.update(
-    SESSION_COOKIE_SAMESITE='None',
-    SESSION_COOKIE_SECURE=True,
-)
 # Initialize our MongoDB-backed db compatibility layer
 db.init_app(app)
 
@@ -325,11 +296,6 @@ def inject_next_page():
             return {'next_page': None}
 
     return {'next_page': None}
-
-# Simple health check for load balancers
-@app.route('/health')
-def health():
-    return jsonify({'status': 'ok'}), 200
 
 # Initialize database
 with app.app_context():
@@ -384,8 +350,6 @@ with app.app_context():
     ensure_column('faculty', 'max_hours_per_week', 'INTEGER')
     ensure_column('faculty', 'user_id', 'INTEGER')
     ensure_column('room', 'tags', 'VARCHAR(255)')
-    ensure_column('student', 'username', 'VARCHAR(80)')
-    ensure_column('student', 'user_id', 'INTEGER')
     ensure_column('student_group', 'total_students', 'INTEGER')
     ensure_column('student_group', 'batches', 'TEXT')
 
@@ -397,7 +361,7 @@ def login_required(f):
     def decorated_function(*args, **kwargs):
         if 'user_id' not in session:
             # If the caller expects JSON (XHR), return JSON error instead of redirect
-            if _wants_json_response():
+            if request.headers.get('X-Requested-With') == 'XMLHttpRequest' or request.is_json:
                 return jsonify({'success': False, 'error': 'Authentication required'}), 401
             return redirect(url_for('login'))
         return f(*args, **kwargs)
@@ -408,13 +372,13 @@ def admin_required(f):
     def decorated_function(*args, **kwargs):
         if 'user_id' not in session:
             # If the caller expects JSON (XHR), return JSON error instead of redirect
-            if _wants_json_response():
+            if request.headers.get('X-Requested-With') == 'XMLHttpRequest' or request.is_json:
                 return jsonify({'success': False, 'error': 'Authentication required'}), 401
             return redirect(url_for('login'))
         user = User.query.get(session['user_id'])
         if not user or user.role != 'admin':
             # For XHR/JSON callers return JSON error; otherwise flash and redirect.
-            if _wants_json_response():
+            if request.headers.get('X-Requested-With') == 'XMLHttpRequest' or request.is_json:
                 return jsonify({'success': False, 'error': 'Access denied. Admin privileges required.'}), 403
             flash('Access denied. Admin privileges required.', 'danger')
             return redirect(url_for('index'))
@@ -474,37 +438,6 @@ def logout():
     session.clear()
     flash('You have been logged out', 'info')
     return redirect(url_for('login'))
-
-# Error handlers that respect JSON callers
-@app.errorhandler(401)
-def handle_401(e):
-    if _wants_json_response():
-        return jsonify({'success': False, 'error': 'Authentication required'}), 401
-    return e
-
-@app.errorhandler(403)
-def handle_403(e):
-    if _wants_json_response():
-        return jsonify({'success': False, 'error': 'Access denied'}), 403
-    return e
-
-@app.errorhandler(404)
-def handle_404(e):
-    if _wants_json_response():
-        return jsonify({'success': False, 'error': 'Not found'}), 404
-    return e
-
-@app.errorhandler(405)
-def handle_405(e):
-    if _wants_json_response():
-        return jsonify({'success': False, 'error': 'Method not allowed'}), 405
-    return e
-
-@app.errorhandler(500)
-def handle_500(e):
-    if _wants_json_response():
-        return jsonify({'success': False, 'error': 'Internal server error'}), 500
-    return e
 
 
 @app.route('/download-template/<entity>')
@@ -1025,66 +958,37 @@ def students():
 @app.route('/students/add', methods=['POST'])
 @admin_required
 def add_student():
-    data = request.json or {}
-    # Basic fields
-    name = (data.get('name') or '').strip()
-    student_id = (data.get('student_id') or '').strip()
-    username = (data.get('username') or '').strip()
-    password = (data.get('password') or '').strip()
-    courses = data.get('courses', []) or []
-
-    if not name or not student_id:
-        return jsonify({'success': False, 'error': 'name and student_id are required'}), 400
-
-    # Create/Link student user account if username provided
-    user = None
-    if username:
-        existing_user = User.query.filter_by(username=username).first()
-        if existing_user:
-            if existing_user.role not in ('student', 'teacher', 'admin'):
-                # Unknown role, but still allow setting to student
-                existing_user.role = 'student'
-            elif existing_user.role != 'student':
-                return jsonify({'success': False, 'error': 'Username already used by another account'}), 400
-            existing_user.name = name
-            if password:
-                existing_user.set_password(password)
-            user = existing_user
-        else:
-            # Create new student user
-            email = f"{username}@student.local"
-            # Ensure email uniqueness
-            if User.query.filter_by(email=email).first():
-                email = f"{username}+{secrets.token_hex(3)}@student.local"
-            user = User(username=username, email=email, role='student', name=name)
-            if password:
-                user.set_password(password)
-            else:
-                user.set_password(secrets.token_urlsafe(8))
-            db.session.add(user)
-            db.session.flush()
-
+    data = request.json
     student = Student(
-        name=name,
-        student_id=student_id,
-        enrolled_courses=','.join(courses),
-        username=username or None,
-        user_id=(user.id if user else None)
+        name=data['name'],
+        student_id=data['student_id'],
+        enrolled_courses=','.join(data.get('courses', []))
     )
     db.session.add(student)
+
+    # Create a login user for the student if credentials provided
+    username = (data.get('username') or '').strip()
+    password = (data.get('password') or '').strip()
+    if username:
+        # Check for username collision
+        existing = User.query.filter_by(username=username).first()
+        if existing and existing.role != 'student':
+            # Adjust username to keep unique
+            username = f"{username}_{secrets.token_hex(2)}"
+        user = existing or User(username=username, email=f"{username}@students.local", role='student', name=data['name'])
+        if password:
+            user.set_password(password)
+        elif not existing:
+            user.set_password(secrets.token_urlsafe(8))
+        db.session.add(user)
+
     db.session.commit()
-    response = {'success': True, 'id': student.id}
-    return jsonify(response)
+    return jsonify({'success': True, 'id': student.id})
 
 @app.route('/students/<int:student_id>/delete', methods=['POST'])
 @admin_required
 def delete_student(student_id):
     student = Student.query.get_or_404(student_id)
-    # Remove linked user account if it exists and is a student
-    if getattr(student, 'user_id', None):
-        u = User.query.get(student.user_id)
-        if u and u.role == 'student':
-            db.session.delete(u)
     db.session.delete(student)
     db.session.commit()
     return jsonify({'success': True})
@@ -1123,35 +1027,21 @@ def import_students():
         if student:
             student.name = name
             student.enrolled_courses = enrolled_courses
-            # Link or create user if username provided
+            # Optional: update or create linked student user
             if username:
-                # Update or create user
-                linked_user = None
-                if getattr(student, 'user_id', None):
-                    linked_user = User.query.get(student.user_id)
-                if linked_user and linked_user.username != username:
-                    # Username changed: if old user was a student, keep it or reassign
-                    pass
-                u = User.query.filter_by(username=username).first()
-                if u:
-                    if u.role != 'student':
-                        u.role = 'student'
-                    u.name = name
+                existing = User.query.filter_by(username=username).first()
+                if existing:
                     if password:
-                        u.set_password(password)
+                        existing.set_password(password)
+                    existing.name = name
+                    existing.role = 'student'
                 else:
-                    email = f"{username}@student.local"
-                    if User.query.filter_by(email=email).first():
-                        email = f"{username}+{secrets.token_hex(3)}@student.local"
-                    u = User(username=username, email=email, role='student', name=name)
+                    user = User(username=username, email=f"{username}@students.local", role='student', name=name)
                     if password:
-                        u.set_password(password)
+                        user.set_password(password)
                     else:
-                        u.set_password(secrets.token_urlsafe(8))
-                    db.session.add(u)
-                    db.session.flush()
-                student.username = username
-                student.user_id = getattr(u, 'id', None)
+                        user.set_password(secrets.token_urlsafe(8))
+                    db.session.add(user)
             updated += 1
         else:
             student = Student(
@@ -1159,29 +1049,21 @@ def import_students():
                 name=name,
                 enrolled_courses=enrolled_courses
             )
-            # Create/link user for new student
-            if username:
-                u = User.query.filter_by(username=username).first()
-                if u:
-                    if u.role != 'student':
-                        u.role = 'student'
-                    u.name = name
-                    if password:
-                        u.set_password(password)
-                else:
-                    email = f"{username}@student.local"
-                    if User.query.filter_by(email=email).first():
-                        email = f"{username}+{secrets.token_hex(3)}@student.local"
-                    u = User(username=username, email=email, role='student', name=name)
-                    if password:
-                        u.set_password(password)
-                    else:
-                        u.set_password(secrets.token_urlsafe(8))
-                    db.session.add(u)
-                    db.session.flush()
-                student.username = username
-                student.user_id = getattr(u, 'id', None)
             db.session.add(student)
+            if username:
+                existing = User.query.filter_by(username=username).first()
+                if existing:
+                    if password:
+                        existing.set_password(password)
+                    existing.name = name
+                    existing.role = 'student'
+                else:
+                    user = User(username=username, email=f"{username}@students.local", role='student', name=name)
+                    if password:
+                        user.set_password(password)
+                    else:
+                        user.set_password(secrets.token_urlsafe(8))
+                    db.session.add(user)
             created += 1
 
     db.session.commit()
@@ -1197,11 +1079,6 @@ def delete_all_students():
         deleted_count = 0
         
         for student in all_students:
-            # Delete linked user account if exists
-            if getattr(student, 'user_id', None):
-                u = User.query.get(student.user_id)
-                if u and u.role == 'student':
-                    db.session.delete(u)
             # Delete student record
             db.session.delete(student)
             deleted_count += 1
